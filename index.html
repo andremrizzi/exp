@@ -161,7 +161,7 @@ const LS_STATE='rdg-sep-estado-v1', LS_MAPA='rdg-sep-mapa-v1';
 const mem={};
 function lsGet(k){try{return localStorage.getItem(k)}catch(e){return mem[k]||null}}
 function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){mem[k]=v}}
-function loadState(){try{const s=JSON.parse(lsGet(LS_STATE)||'null');if(s&&s.pedidos)return s}catch(e){}return{pedidos:{}}}
+function loadState(){try{const s=JSON.parse(lsGet(LS_STATE)||'null');if(s&&s.pedidos){s.ignorar=s.ignorar||[];return s}}catch(e){}return{pedidos:{},ignorar:[]}}
 let store=loadState();
 function save(){lsSet(LS_STATE,JSON.stringify(store))}
 
@@ -314,9 +314,9 @@ async function carregar(files){
 }
 
 /* ---------- pasta do Drive ---------- */
-const DEFAULT_DRIVE_URL='https://script.google.com/macros/s/AKfycbxnR-lbKo28AXb8820yBIeV_OHsab45ezzyzhyJPkrIpzUEUCM_IV7meBzKLGCbpb8/exec',LS_DRIVE='rdg-sep-drive-v1';
-let drive=(()=>{let o={};try{o=JSON.parse(lsGet(LS_DRIVE)||'{}')||{}}catch(e){}return{url:o.url||DEFAULT_DRIVE_URL,senha:o.senha||''}})();
-let driveList=null,driveErr='',driveBusy=false;
+const DEFAULT_DRIVE_URL='https://script.google.com/macros/s/AKfycbxnR-lbKo28AXb8820yBIeV_OHsab45ezzyzhyJPkrIpzUEUCM_IV7meBzKLGCbpb8/exec',DEFAULT_DRIVE_SENHA='rdg',LS_DRIVE='rdg-sep-drive-v1';
+let drive=(()=>{let o={};try{o=JSON.parse(lsGet(LS_DRIVE)||'{}')||{}}catch(e){}return{url:o.url||DEFAULT_DRIVE_URL,senha:o.senha||DEFAULT_DRIVE_SENHA}})();
+let driveList=null,driveErr='',driveBusy=false,driveLoading=false,driveHora='',driveUltima=0;const driveFalhas=new Set();
 async function driveFetch(params){
   const u=new URL(drive.url);
   Object.entries({senha:drive.senha,...params}).forEach(([k,v])=>u.searchParams.set(k,v));
@@ -328,23 +328,32 @@ function keepInput(fn){
   const q=document.getElementById('q'),val=q?q.value:'',foco=q&&document.activeElement===q;
   fn();const n=document.getElementById('q');if(n&&val){n.value=val;if(foco)n.focus()}
 }
+function limparSaidos(){
+  if(!driveList)return;let mudou=false;
+  for(const [n,p] of Object.entries(store.pedidos)){
+    if(p.driveId&&!driveList.some(f=>f.id===p.driveId)){const t=stat(p);if(t.pend===0&&t.fa===0){delete store.pedidos[n];mudou=true}}
+  }
+  if(mudou)save();
+}
 async function driveAtualizar(){
-  if(!drive.url||driveBusy)return;
-  driveBusy=true;if(view==='home')keepInput(render);
-  try{driveList=(await driveFetch({acao:'lista'})).pedidos;driveErr=''}
+  if(!drive.url||!drive.senha||driveBusy||driveLoading)return;
+  driveUltima=Date.now();driveBusy=true;if(view==='home')keepInput(render);
+  try{driveList=(await driveFetch({acao:'lista'})).pedidos;driveErr='';
+      driveHora=new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});limparSaidos()}
   catch(e){driveErr='Não consegui falar com o Drive ('+e.message+')'}
   driveBusy=false;if(view==='home')keepInput(render);
+  if(!driveErr){const n=driveNovos().filter(f=>!driveFalhas.has(f.id));if(n.length)await driveCarregar(n.map(f=>f.id))}
 }
 async function driveCarregar(ids){
-  avisos=[{t:'Carregando '+ids.length+' pedido(s) do Drive…'}];if(view==='home')render();
+  driveLoading=true;avisos=[{t:'Carregando '+ids.length+' pedido(s) do Drive…'}];if(view==='home')keepInput(render);
   const out=[];
   for(const id of ids){
     try{const j=await driveFetch({acao:'arquivo',id});
       const bin=atob(j.pdf),buf=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++)buf[k]=bin.charCodeAt(k);
-      out.push(await importar(j.nome,buf,id));
-    }catch(e){out.push({bad:true,t:'Erro ao baixar do Drive ('+e.message+')'})}
+      const r=await importar(j.nome,buf,id);out.push(r);if(r.bad&&!/ATENÇÃO/.test(r.t))driveFalhas.add(id);
+    }catch(e){driveFalhas.add(id);out.push({bad:true,t:'Erro ao baixar do Drive ('+e.message+')'})}
   }
-  save();avisos=out;if(view==='home')render();
+  save();driveLoading=false;avisos=out;if(view==='home')keepInput(render);
 }
 setInterval(()=>{if(view==='home'&&drive.url&&!document.hidden)driveAtualizar()},60000);
 
@@ -382,21 +391,19 @@ function rHome(){
   document.getElementById('add').onclick=()=>document.getElementById('file').click();
   $app.querySelectorAll('[data-open]').forEach(el=>el.onclick=()=>setView('sep',el.dataset.open));
   const da=document.getElementById('dratu');if(da)da.onclick=driveAtualizar;
-  $app.querySelectorAll('[data-dr]').forEach(b=>b.onclick=()=>driveCarregar([b.dataset.dr]));
-  const dall=document.getElementById('drall');if(dall)dall.onclick=()=>driveCarregar(driveNovos().map(f=>f.id));
+  if(drive.url&&drive.senha&&!driveBusy&&!driveLoading&&Date.now()-driveUltima>15000)setTimeout(driveAtualizar,50);
+  $app.querySelectorAll('[data-dr]').forEach(b=>b.onclick=()=>{driveFalhas.delete(b.dataset.dr);driveCarregar([b.dataset.dr])});
 }
-function driveNovos(){const ids=new Set(Object.values(store.pedidos).map(p=>p.driveId).filter(Boolean));return(driveList||[]).filter(f=>!ids.has(f.id))}
+function driveNovos(){const ids=new Set([...Object.values(store.pedidos).map(p=>p.driveId).filter(Boolean),...store.ignorar]);return(driveList||[]).filter(f=>!ids.has(f.id))}
 function driveCard(){
   if(!drive.url)return`<div class="card small mut">Pasta do Drive ainda não configurada (aba Dados).</div>`;
   if(!drive.senha)return`<div class="card small">Para ver os pedidos da pasta do Drive, digite a senha na aba <b>Dados</b>.</div>`;
-  const novos=driveNovos();
-  return`<div class="card"><div class="row" style="justify-content:space-between"><span class="h">Na pasta do Drive</span><button class="btn ghost sm" id="dratu">${driveBusy?'Atualizando…':'Atualizar'}</button></div>
-  ${driveErr?`<div class="msg bad">${esc(driveErr)}</div>`:''}
-  ${driveList===null&&!driveErr?'<div class="mut small" style="margin-top:6px">Buscando…</div>':''}
-  ${driveList&&!novos.length&&!driveErr?'<div class="mut small" style="margin-top:6px">Nada novo na pasta.</div>':''}
-  ${novos.map(f=>`<div class="row" style="justify-content:space-between;margin-top:8px"><span>${esc(f.nome)}</span><button class="btn sm" data-dr="${esc(f.id)}">Carregar</button></div>`).join('')}
-  ${novos.length>1?`<div style="margin-top:10px"><button class="btn sm" id="drall">Carregar todos (${novos.length})</button></div>`:''}</div>`;
+  const falhas=driveNovos().filter(f=>driveFalhas.has(f.id));
+  return`<div class="card"><div class="row" style="justify-content:space-between"><span class="h">Pasta do Drive</span><button class="btn ghost sm" id="dratu">${driveBusy||driveLoading?'Atualizando…':'Atualizar'}</button></div>
+  ${driveErr?`<div class="msg bad">${esc(driveErr)}</div>`:`<div class="mut small" style="margin-top:6px">${driveList===null?'Buscando…':'Pedidos novos entram sozinhos · conferido às '+esc(driveHora)}</div>`}
+  ${falhas.map(f=>`<div class="row" style="justify-content:space-between;margin-top:8px"><span>${esc(f.nome)} <span class="tag bad">não carregou</span></span><button class="btn sm" data-dr="${esc(f.id)}">Tentar de novo</button></div>`).join('')}</div>`;
 }
+
 
 function rSep(){
   const p=store.pedidos[cur];if(!p)return setView('home');
@@ -428,7 +435,7 @@ function rSep(){
   document.getElementById('ocultar').onclick=()=>{hideDone=!hideDone;render()};
   document.getElementById('imp').onclick=()=>{imprimir(p,picks);window.print()};
   document.getElementById('reset').onclick=()=>{if(confirm('Limpar todas as marcações do pedido '+cur+'?')){p.st={};save();render()}};
-  document.getElementById('del').onclick=()=>{if(confirm('Remover o pedido '+cur+' do aparelho?')){delete store.pedidos[cur];save();setView('home')}};
+  document.getElementById('del').onclick=()=>{if(confirm('Remover o pedido '+cur+' do aparelho?')){if(p.driveId&&!store.ignorar.includes(p.driveId))store.ignorar.push(p.driveId);delete store.pedidos[cur];save();setView('home')}};
   $app.querySelectorAll('[data-chip]').forEach(b=>b.onclick=()=>{const k=b.dataset.chip,v=p.st[k];
     if(!v)p.st[k]='ok';else if(v==='ok')p.st[k]='falta';else delete p.st[k];save();keep(render)});
   $app.querySelectorAll('[data-row]').forEach(b=>b.onclick=()=>{
@@ -493,10 +500,10 @@ function rDados(){
     lsSet(LS_DRIVE,JSON.stringify(drive));const m=document.getElementById('dmsg');
     if(!drive.url){m.textContent='Sem endereço.';return}
     m.textContent='Testando…';driveBusy=false;driveList=null;
-    try{const j=await driveFetch({acao:'lista'});driveList=j.pedidos;driveErr='';m.textContent='Funcionou: '+j.pedidos.length+' PDF(s) na pasta.'}
+    try{const j=await driveFetch({acao:'lista'});driveList=j.pedidos;driveErr='';m.textContent='Funcionou: '+j.pedidos.length+' PDF(s) na pasta. Os pedidos entram sozinhos na tela Pedidos.';driveUltima=0}
     catch(e){m.textContent='Não funcionou: '+e.message}};
   document.getElementById('im').onclick=()=>document.getElementById('filejson').click();
-  document.getElementById('cl').onclick=()=>{if(confirm('Apagar todos os pedidos deste aparelho?')){store={pedidos:{}};save();setView('home')}};
+  document.getElementById('cl').onclick=()=>{if(confirm('Apagar todos os pedidos deste aparelho?')){store={pedidos:{},ignorar:[]};save();setView('home')}};
 }
 
 /* ---------- eventos globais ---------- */
