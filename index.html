@@ -217,8 +217,8 @@ function shelfLabel(s){
 /* ---------- leitura do PDF do pedido ---------- */
 window.pdfjsWorker=window['pdfjs-dist/build/pdf.worker'];
 pdfjsLib.GlobalWorkerOptions.workerSrc='data:,';
-async function lerPdf(file){
-  const buf=new Uint8Array(await file.arrayBuffer());
+async function lerPdf(file){return lerBytes(new Uint8Array(await file.arrayBuffer()))}
+async function lerBytes(buf){
   const doc=await pdfjsLib.getDocument({data:buf,disableFontFace:true}).promise;
   const pages=[];
   for(let p=1;p<=doc.numPages;p++){
@@ -297,19 +297,56 @@ function buildPicks(p){
   return arr;
 }
 const skey=(x,tam)=>x.ref+'|'+x.cor+'|'+tam;
+async function importar(nome,buf,driveId){
+  try{
+    const r=await lerBytes(buf);
+    if(!r.meta.num||!r.items.length)return{bad:true,t:nome+': não encontrei pedido neste PDF'};
+    const ant=store.pedidos[r.meta.num];
+    store.pedidos[r.meta.num]={meta:r.meta,items:r.items,st:ant?ant.st:{},carregado:Date.now(),driveId:driveId||(ant&&ant.driveId)||null};
+    const ruim=r.items.filter(i=>!i.ok);
+    return{bad:ruim.length>0,t:'Pedido '+r.meta.num+' · '+r.items.length+' referências · '+r.items.reduce((a,i)=>a+i.qty,0)+' peças'+(ant?' (atualizado, marcações mantidas)':'')+(ruim.length?' · ATENÇÃO: conferir leitura de '+ruim.map(i=>i.ref).join(', '):'')};
+  }catch(e){return{bad:true,t:nome+': erro ao ler ('+e.message+')'}}
+}
 async function carregar(files){
   const out=[];
-  for(const f of files){
-    try{
-      const r=await lerPdf(f);
-      if(!r.meta.num||!r.items.length){out.push({bad:true,t:f.name+': não encontrei pedido neste PDF'});continue}
-      const ant=store.pedidos[r.meta.num];
-      store.pedidos[r.meta.num]={meta:r.meta,items:r.items,st:ant?ant.st:{},carregado:Date.now()};
-      out.push({bad:r.items.some(i=>!i.ok),t:'Pedido '+r.meta.num+' · '+r.items.length+' referências · '+r.items.reduce((a,i)=>a+i.qty,0)+' peças'+(ant?' (atualizado, marcações mantidas)':'')+(r.items.some(i=>!i.ok)?' · ATENÇÃO: conferir leitura de '+r.items.filter(i=>!i.ok).map(i=>i.ref).join(', '):'')});
-    }catch(e){out.push({bad:true,t:f.name+': erro ao ler ('+e.message+')'})}
-  }
+  for(const f of files)out.push(await importar(f.name,new Uint8Array(await f.arrayBuffer())));
   save();return out;
 }
+
+/* ---------- pasta do Drive ---------- */
+const DEFAULT_DRIVE_URL='https://script.google.com/macros/s/AKfycbxnR-lbKo28AXb8820yBIeV_OHsab45ezzyzhyJPkrIpzUEUCM_IV7meBzKLGCbpb8/exec',LS_DRIVE='rdg-sep-drive-v1';
+let drive=(()=>{let o={};try{o=JSON.parse(lsGet(LS_DRIVE)||'{}')||{}}catch(e){}return{url:o.url||DEFAULT_DRIVE_URL,senha:o.senha||''}})();
+let driveList=null,driveErr='',driveBusy=false;
+async function driveFetch(params){
+  const u=new URL(drive.url);
+  Object.entries({senha:drive.senha,...params}).forEach(([k,v])=>u.searchParams.set(k,v));
+  const r=await fetch(u.toString());const j=await r.json();
+  if(j.erro)throw new Error(j.erro==='senha'?'senha incorreta':j.erro);
+  return j;
+}
+function keepInput(fn){
+  const q=document.getElementById('q'),val=q?q.value:'',foco=q&&document.activeElement===q;
+  fn();const n=document.getElementById('q');if(n&&val){n.value=val;if(foco)n.focus()}
+}
+async function driveAtualizar(){
+  if(!drive.url||driveBusy)return;
+  driveBusy=true;if(view==='home')keepInput(render);
+  try{driveList=(await driveFetch({acao:'lista'})).pedidos;driveErr=''}
+  catch(e){driveErr='Não consegui falar com o Drive ('+e.message+')'}
+  driveBusy=false;if(view==='home')keepInput(render);
+}
+async function driveCarregar(ids){
+  avisos=[{t:'Carregando '+ids.length+' pedido(s) do Drive…'}];if(view==='home')render();
+  const out=[];
+  for(const id of ids){
+    try{const j=await driveFetch({acao:'arquivo',id});
+      const bin=atob(j.pdf),buf=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++)buf[k]=bin.charCodeAt(k);
+      out.push(await importar(j.nome,buf,id));
+    }catch(e){out.push({bad:true,t:'Erro ao baixar do Drive ('+e.message+')'})}
+  }
+  save();avisos=out;if(view==='home')render();
+}
+setInterval(()=>{if(view==='home'&&drive.url&&!document.hidden)driveAtualizar()},60000);
 
 /* ---------- telas ---------- */
 const $app=document.getElementById('app');
@@ -327,11 +364,12 @@ function rHome(){
   <div class="row"><input class="q" id="q" inputmode="numeric" placeholder="Digite ou bipe o número do pedido" autocomplete="off">
   <button class="btn" id="abrir">Abrir</button><button class="btn ghost" id="add">+ Carregar PDF</button></div>
   <div id="av">${avisos.map(a=>`<div class="msg ${a.bad?'bad':''}">${esc(a.t)}</div>`).join('')}</div>
+  ${driveCard()}
   ${peds.length?'':'<div class="card mut">Nenhum pedido carregado. Toque em “+ Carregar PDF” e escolha o pedido impresso do Sisplan (pode escolher vários de uma vez).</div>'}
   ${peds.map(({n,p})=>{const s=stat(p);const pct=s.t?Math.round(s.ok/s.t*100):0;return`
   <div class="card click" data-open="${n}">
     <div class="row" style="justify-content:space-between"><span class="h">Pedido ${n}</span>
-      <span>${s.pend===0&&s.fa===0?'<span class="tag" style="border-color:var(--ok);color:var(--ok)">completo</span>':''}${s.fa?` <span class="tag bad">${s.fa} faltando</span>`:''}</span></div>
+      <span>${driveList&&p.driveId&&!driveList.some(f=>f.id===p.driveId)?'<span class="tag warn">saiu do Drive</span> ':''}${s.pend===0&&s.fa===0?'<span class="tag" style="border-color:var(--ok);color:var(--ok)">completo</span>':''}${s.fa?` <span class="tag bad">${s.fa} faltando</span>`:''}</span></div>
     <div>${esc(p.meta.cliente)} <span class="mut">· ${esc(p.meta.cidade)}</span></div>
     <div class="mut small">Rep.: ${esc(p.meta.rep)} · Prev. saída ${esc(p.meta.prevSaida)} · ${p.items.length} refs</div>
     ${bar(s)}<div class="small mut" style="margin-top:4px">${s.ok} de ${s.t} peças separadas (${pct}%)</div>
@@ -343,6 +381,21 @@ function rHome(){
   q.onkeydown=e=>{if(e.key==='Enter')abrir()};
   document.getElementById('add').onclick=()=>document.getElementById('file').click();
   $app.querySelectorAll('[data-open]').forEach(el=>el.onclick=()=>setView('sep',el.dataset.open));
+  const da=document.getElementById('dratu');if(da)da.onclick=driveAtualizar;
+  $app.querySelectorAll('[data-dr]').forEach(b=>b.onclick=()=>driveCarregar([b.dataset.dr]));
+  const dall=document.getElementById('drall');if(dall)dall.onclick=()=>driveCarregar(driveNovos().map(f=>f.id));
+}
+function driveNovos(){const ids=new Set(Object.values(store.pedidos).map(p=>p.driveId).filter(Boolean));return(driveList||[]).filter(f=>!ids.has(f.id))}
+function driveCard(){
+  if(!drive.url)return`<div class="card small mut">Pasta do Drive ainda não configurada (aba Dados).</div>`;
+  if(!drive.senha)return`<div class="card small">Para ver os pedidos da pasta do Drive, digite a senha na aba <b>Dados</b>.</div>`;
+  const novos=driveNovos();
+  return`<div class="card"><div class="row" style="justify-content:space-between"><span class="h">Na pasta do Drive</span><button class="btn ghost sm" id="dratu">${driveBusy?'Atualizando…':'Atualizar'}</button></div>
+  ${driveErr?`<div class="msg bad">${esc(driveErr)}</div>`:''}
+  ${driveList===null&&!driveErr?'<div class="mut small" style="margin-top:6px">Buscando…</div>':''}
+  ${driveList&&!novos.length&&!driveErr?'<div class="mut small" style="margin-top:6px">Nada novo na pasta.</div>':''}
+  ${novos.map(f=>`<div class="row" style="justify-content:space-between;margin-top:8px"><span>${esc(f.nome)}</span><button class="btn sm" data-dr="${esc(f.id)}">Carregar</button></div>`).join('')}
+  ${novos.length>1?`<div style="margin-top:10px"><button class="btn sm" id="drall">Carregar todos (${novos.length})</button></div>`:''}</div>`;
 }
 
 function rSep(){
@@ -427,9 +480,21 @@ function rDados(){
   $app.innerHTML=`<div class="h">Dados</div>
   <div class="card"><div class="mut small">As marcações ficam salvas neste aparelho. Para levar para outro tablet ou computador, exporte e importe aqui.</div>
   <div class="row" style="margin-top:10px"><button class="btn" id="ex">Exportar marcações</button><button class="btn ghost" id="im">Importar marcações</button></div></div>
+  <div class="card"><div class="h" style="font-size:17px">Pasta do Drive</div>
+  <div class="mut small">Endereço do script e senha. A senha é digitada uma vez em cada tablet.</div>
+  <input class="q" id="dur" placeholder="Endereço do script (https://script.google.com/...)" value="${esc(drive.url)}" style="width:100%;margin-top:8px;font-size:15px">
+  <input class="q" id="dsn" type="password" placeholder="Senha" value="${esc(drive.senha)}" style="width:100%;margin-top:8px">
+  <div class="row" style="margin-top:10px"><button class="btn" id="dsv">Salvar e testar</button></div><div id="dmsg" class="small" style="margin-top:8px"></div></div>
   <div class="card"><div class="mut small">Apagar todos os pedidos carregados e marcações deste aparelho (o mapa de prateleiras não é apagado).</div>
   <div class="row" style="margin-top:10px"><button class="btn ghost" id="cl">Apagar pedidos</button></div></div>`;
   document.getElementById('ex').onclick=()=>{const b=new Blob([JSON.stringify(store)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='separacao-'+new Date().toISOString().slice(0,10)+'.json';a.click()};
+  document.getElementById('dsv').onclick=async()=>{
+    drive={url:document.getElementById('dur').value.trim(),senha:document.getElementById('dsn').value.trim()};
+    lsSet(LS_DRIVE,JSON.stringify(drive));const m=document.getElementById('dmsg');
+    if(!drive.url){m.textContent='Sem endereço.';return}
+    m.textContent='Testando…';driveBusy=false;driveList=null;
+    try{const j=await driveFetch({acao:'lista'});driveList=j.pedidos;driveErr='';m.textContent='Funcionou: '+j.pedidos.length+' PDF(s) na pasta.'}
+    catch(e){m.textContent='Não funcionou: '+e.message}};
   document.getElementById('im').onclick=()=>document.getElementById('filejson').click();
   document.getElementById('cl').onclick=()=>{if(confirm('Apagar todos os pedidos deste aparelho?')){store={pedidos:{}};save();setView('home')}};
 }
@@ -441,6 +506,7 @@ document.getElementById('filejson').onchange=async e=>{const f=e.target.files[0]
   try{const j=JSON.parse(await f.text());if(!j.pedidos)throw 0;
     for(const [n,p] of Object.entries(j.pedidos)){const a=store.pedidos[n];if(a){Object.assign(a.st,p.st)}else store.pedidos[n]=p}
     save();avisos=[{t:'Marcações importadas.'}];setView('home')}catch(x){alert('Arquivo inválido.')}};
+if(drive.url&&drive.senha)driveAtualizar();
 window.__rdg={parseRows,lerPdf,buildPicks,locate,store:()=>store,carregar,MAPf:()=>MAP};
 render();
 </script>
